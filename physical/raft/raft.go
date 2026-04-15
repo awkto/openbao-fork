@@ -1193,6 +1193,37 @@ func (b *RaftBackend) AppliedIndex() uint64 {
 	return indexState.Index
 }
 
+// TransferLeadershipTo transfers Raft leadership to a specific server by ID.
+// This is used by version-gated leader election to ensure a newer-version
+// node wins the election rather than a random follower.
+func (b *RaftBackend) TransferLeadershipTo(targetID string) error {
+	b.l.RLock()
+	defer b.l.RUnlock()
+
+	if b.raft == nil {
+		return errors.New("raft not initialized")
+	}
+
+	// Look up the server's address from the current Raft configuration.
+	configFuture := b.raft.GetConfiguration()
+	if err := configFuture.Error(); err != nil {
+		return fmt.Errorf("failed to get raft configuration: %w", err)
+	}
+	var targetAddr raft.ServerAddress
+	for _, srv := range configFuture.Configuration().Servers {
+		if string(srv.ID) == targetID {
+			targetAddr = srv.Address
+			break
+		}
+	}
+	if targetAddr == "" {
+		return fmt.Errorf("server %s not found in raft configuration", targetID)
+	}
+
+	future := b.raft.LeadershipTransferToServer(raft.ServerID(targetID), targetAddr)
+	return future.Error()
+}
+
 // WriteDRRecoveryPeers writes a peers.json file to the Raft data directory
 // that will be consumed on the next startup to reconfigure the cluster.
 // This is used for DR failover: the non-voter writes a peers.json that

@@ -18,6 +18,7 @@ import (
 	metrics "github.com/hashicorp/go-metrics/compat"
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/go-uuid"
+	semver "github.com/hashicorp/go-version"
 	"github.com/oklog/run"
 	"github.com/openbao/openbao/helper/namespace"
 	"github.com/openbao/openbao/sdk/v2/helper/certutil"
@@ -728,31 +729,6 @@ func (c *Core) waitForLeadership(manualStepDownCh, stopCh <-chan struct{}) {
 
 		c.logger.Info("acquired lock, enabling active operation")
 
-		// Version-gated leader election: if other nodes in the cluster are
-		// running a newer version (as reported via Echo heartbeats), this
-		// node should defer leadership to let a newer node take over. This
-		// enables zero-downtime rolling upgrades where the newest version
-		// always leads.
-		if c.raftFollowerStates != nil && c.raftFollowerStates.HaveFollower() {
-			shouldDefer := false
-			myVersion := c.effectiveSDKVersion
-			for nodeID, state := range c.raftFollowerStates.GetAll() {
-				if state.UpgradeVersion != "" && state.UpgradeVersion > myVersion {
-					c.logger.Warn("version-gated leader election: deferring leadership to newer node",
-						"my_version", myVersion,
-						"newer_node", nodeID,
-						"newer_version", state.UpgradeVersion)
-					shouldDefer = true
-					break
-				}
-			}
-			if shouldDefer {
-				lock.Unlock()
-				time.Sleep(5 * time.Second)
-				continue
-			}
-		}
-
 		// This is used later to log a metrics event; this can be helpful to
 		// detect flapping
 		activeTime := time.Now()
@@ -888,6 +864,58 @@ func (c *Core) waitForLeadership(manualStepDownCh, stopCh <-chan struct{}) {
 			lock.Unlock()
 			metrics.MeasureSince([]string{"core", "leadership_setup_failed"}, activeTime)
 			continue
+		}
+
+		// Version-gated leader election: now that we're fully active and
+		// the cluster forwarding is established, periodically check if a
+		// newer-version follower exists. If so, transfer leadership directly
+		// to that node using Raft's LeadershipTransferToServer.
+		if c.raftFollowerStates != nil {
+			go func() {
+				myVersion, myErr := semver.NewVersion(c.effectiveSDKVersion)
+				if myErr != nil {
+					return
+				}
+				// Check 4 times over 60s (at 15s, 30s, 45s, 60s).
+				for attempt := 1; attempt <= 4; attempt++ {
+					time.Sleep(15 * time.Second)
+					for nodeID, state := range c.raftFollowerStates.GetAll() {
+						if state.UpgradeVersion == "" {
+							continue
+						}
+						theirVersion, err := semver.NewVersion(state.UpgradeVersion)
+						if err != nil {
+							continue
+						}
+						if theirVersion.GreaterThan(myVersion) {
+							c.logger.Warn("version-gated leader election: transferring leadership to newer node",
+								"my_version", myVersion.String(),
+								"newer_node", nodeID,
+								"newer_version", theirVersion.String(),
+								"check_attempt", attempt)
+							// Use Raft's targeted leadership transfer to ensure
+							// the newer node specifically wins the election.
+							if rb := c.GetRaftBackend(); rb != nil {
+								if err := rb.TransferLeadershipTo(nodeID); err != nil {
+									c.logger.Error("version-gated leader election: transfer failed, falling back to step-down",
+										"error", err)
+									select {
+									case c.manualStepDownCh <- struct{}{}:
+									default:
+									}
+								}
+							}
+							return
+						}
+					}
+					c.logger.Debug("version-gated leader election: no newer node found",
+						"my_version", myVersion.String(),
+						"check_attempt", attempt,
+						"followers", len(c.raftFollowerStates.GetAll()))
+				}
+				c.logger.Info("version-gated leader election: confirmed newest version after all checks",
+					"my_version", myVersion.String())
+			}()
 		}
 
 		// Monitor a loss of leadership
