@@ -267,6 +267,18 @@ func (s *FollowerStates) HaveFollower() bool {
 	return len(s.followers) > 0
 }
 
+// GetAll returns a snapshot of all follower states keyed by node ID.
+func (s *FollowerStates) GetAll() map[string]FollowerState {
+	s.l.RLock()
+	defer s.l.RUnlock()
+
+	out := make(map[string]FollowerState, len(s.followers))
+	for id, state := range s.followers {
+		out[id] = *state
+	}
+	return out
+}
+
 // SetFollowerStates sets the followerStates field in the backend to track peers
 // in the raft cluster.
 func (b *RaftBackend) SetFollowerStates(states *FollowerStates) {

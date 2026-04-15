@@ -1193,6 +1193,32 @@ func (b *RaftBackend) AppliedIndex() uint64 {
 	return indexState.Index
 }
 
+// WaitForAppliedIndex blocks until the FSM's applied index reaches at least
+// the given index, or the context is cancelled. This is used by standby nodes
+// to ensure read-after-write consistency: a client can supply the index from
+// a prior write response and the standby will wait until that write has been
+// replicated and applied locally before serving the read.
+func (b *RaftBackend) WaitForAppliedIndex(ctx context.Context, index uint64) error {
+	// Fast path: already at or past the requested index.
+	if b.AppliedIndex() >= index {
+		return nil
+	}
+
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if b.AppliedIndex() >= index {
+				return nil
+			}
+		}
+	}
+}
+
 // Term returns the raft term of this node.
 func (b *RaftBackend) Term() uint64 {
 	b.l.RLock()

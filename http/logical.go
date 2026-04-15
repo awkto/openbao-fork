@@ -4,6 +4,7 @@
 package http
 
 import (
+	"context"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
@@ -367,6 +368,28 @@ func handleLogicalInternal(core *vault.Core, injectDataIntoTopLevel, noForward b
 			return
 		}
 
+		// Read-after-write consistency: if the client supplied a required
+		// index and we are a standby with reads enabled, wait until our
+		// local Raft applied index catches up before serving the request.
+		if core.HAEnabled() && core.Standby() && core.StandbyReadsEnabled() {
+			if reqIdx := r.Header.Get(vault.BaoRequireIndexHeaderName); reqIdx != "" {
+				if idx, err := strconv.ParseUint(reqIdx, 10, 64); err == nil && idx > 0 {
+					waitCtx, waitCancel := context.WithTimeout(r.Context(), vault.DefaultRequireIndexTimeout)
+					waitErr := core.WaitForIndex(waitCtx, idx)
+					waitCancel()
+					if waitErr != nil {
+						// Timeout waiting for index — forward to active node
+						// which is guaranteed to have the data.
+						core.Logger().Debug("standby index wait timeout, forwarding to active",
+							"required_index", idx,
+							"current_index", core.GetCurrentIndex())
+						forwardRequest(core, w, r)
+						return
+					}
+				}
+			}
+		}
+
 		req, statusCode, err := buildLogicalRequest(core, w, r)
 		if err != nil || statusCode != 0 {
 			respondError(w, statusCode, err)
@@ -392,6 +415,12 @@ func handleLogicalInternal(core *vault.Core, injectDataIntoTopLevel, noForward b
 			// in this case.
 			return
 		default:
+			// Emit current Raft applied index on every response so clients
+			// can use it for read-after-write consistency on standby nodes.
+			if currentIdx := core.GetCurrentIndex(); currentIdx > 0 {
+				w.Header().Set(vault.BaoIndexHeaderName, strconv.FormatUint(currentIdx, 10))
+			}
+
 			// Build and return the proper response if everything is fine.
 			respondLogical(core, w, r, req, resp, injectDataIntoTopLevel)
 			return

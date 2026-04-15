@@ -4516,10 +4516,17 @@ func (b *SystemBackend) handleHAStatus(ctx context.Context, req *logical.Request
 		return nil, err
 	}
 
+	data := map[string]interface{}{
+		"nodes": nodes,
+	}
+
+	// Add cluster health summary from autopilot if using Raft.
+	if clusterHealth := b.Core.getClusterHealth(); clusterHealth != nil {
+		data["cluster_health"] = clusterHealth
+	}
+
 	return &logical.Response{
-		Data: map[string]interface{}{
-			"nodes": nodes,
-		},
+		Data: data,
 	}, nil
 }
 
@@ -4531,6 +4538,22 @@ type HAStatusNode struct {
 	LastEcho       *time.Time `json:"last_echo"`
 	Version        string     `json:"version"`
 	UpgradeVersion string     `json:"upgrade_version,omitempty"`
+	// HA Enterprise fields
+	RaftAppliedIndex uint64 `json:"raft_applied_index,omitempty"`
+	ReplicationLag   uint64 `json:"replication_lag,omitempty"`
+	Role             string `json:"role,omitempty"`
+	Healthy          bool   `json:"healthy,omitempty"`
+}
+
+// ClusterHealthSummary provides an overview of the Raft cluster's health
+// for enterprise monitoring and alerting.
+type ClusterHealthSummary struct {
+	Healthy          bool              `json:"healthy"`
+	FailureTolerance int               `json:"failure_tolerance"`
+	Leader           string            `json:"leader"`
+	Voters           []string          `json:"voters"`
+	NonVoters        []string          `json:"non_voters"`
+	ReplicationLag   map[string]uint64 `json:"replication_lag"`
 }
 
 func (b *SystemBackend) handleVersionHistoryList(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
