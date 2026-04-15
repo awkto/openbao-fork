@@ -728,6 +728,31 @@ func (c *Core) waitForLeadership(manualStepDownCh, stopCh <-chan struct{}) {
 
 		c.logger.Info("acquired lock, enabling active operation")
 
+		// Version-gated leader election: if other nodes in the cluster are
+		// running a newer version (as reported via Echo heartbeats), this
+		// node should defer leadership to let a newer node take over. This
+		// enables zero-downtime rolling upgrades where the newest version
+		// always leads.
+		if c.raftFollowerStates != nil && c.raftFollowerStates.HaveFollower() {
+			shouldDefer := false
+			myVersion := c.effectiveSDKVersion
+			for nodeID, state := range c.raftFollowerStates.GetAll() {
+				if state.UpgradeVersion != "" && state.UpgradeVersion > myVersion {
+					c.logger.Warn("version-gated leader election: deferring leadership to newer node",
+						"my_version", myVersion,
+						"newer_node", nodeID,
+						"newer_version", state.UpgradeVersion)
+					shouldDefer = true
+					break
+				}
+			}
+			if shouldDefer {
+				lock.Unlock()
+				time.Sleep(5 * time.Second)
+				continue
+			}
+		}
+
 		// This is used later to log a metrics event; this can be helpful to
 		// detect flapping
 		activeTime := time.Now()

@@ -13,6 +13,10 @@ STANDBY="baoha-2.dnsif.ca"
 DR_NODE="baoha-dr-1.dnsif.ca"
 TOKEN="${BAO_TOKEN:-}"
 UNSEAL_KEY="${BAO_UNSEAL_KEY:-}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CA_CERT="${BAO_CACERT:-${SCRIPT_DIR}/tls/ca-cert.pem}"
+CURL="curl -s --cacert $CA_CERT"
+SCHEME="https"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -60,7 +64,7 @@ echo ""
 echo "All standby nodes serve reads locally. Writes forward to leader."
 pause
 
-run "curl -s -H 'X-Vault-Token: $TOKEN' http://$LEADER:8200/v1/sys/ha-status | python3 -m json.tool"
+run "$CURL -H 'X-Vault-Token: $TOKEN' ${SCHEME}://$LEADER:8200/v1/sys/ha-status | python3 -m json.tool"
 pause
 
 # ──────────────────────────────────────────────────
@@ -69,13 +73,13 @@ echo "When the active node processes a write, it returns the Raft applied"
 echo "index in the X-Bao-Index response header."
 pause
 
-run "curl -s -D /dev/stderr -H 'X-Vault-Token: $TOKEN' -X POST -d '{\"data\":{\"password\":\"s3cret\",\"env\":\"production\"}}' http://$LEADER:8200/v1/secret/data/demo-secret 2>&1 | grep -E 'X-Bao-Index|HTTP'"
+run "$CURL -D /dev/stderr -H 'X-Vault-Token: $TOKEN' -X POST -d '{\"data\":{\"password\":\"s3cret\",\"env\":\"production\"}}' ${SCHEME}://$LEADER:8200/v1/secret/data/demo-secret 2>&1 | grep -E 'X-Bao-Index|HTTP'"
 echo ""
 echo -e "${YELLOW}Notice the X-Bao-Index header in the response.${NC}"
 pause
 
 # Get the actual index value
-BAO_IDX=$(curl -s -D- -H "X-Vault-Token: $TOKEN" http://$LEADER:8200/v1/secret/data/demo-secret 2>&1 | grep -i X-Bao-Index | awk '{print $2}' | tr -d '\r')
+BAO_IDX=$($CURL -D- -H "X-Vault-Token: $TOKEN" ${SCHEME}://$LEADER:8200/v1/secret/data/demo-secret 2>&1 | grep -i X-Bao-Index | awk '{print $2}' | tr -d '\r')
 echo -e "Captured index: ${GREEN}$BAO_IDX${NC}"
 pause
 
@@ -87,7 +91,7 @@ echo ""
 echo "This eliminates stale reads / 404s after mount creation."
 pause
 
-run "curl -s -H 'X-Vault-Token: $TOKEN' -H 'X-Bao-Require-Index: $BAO_IDX' http://$STANDBY:8200/v1/secret/data/demo-secret | python3 -m json.tool"
+run "$CURL -H 'X-Vault-Token: $TOKEN' -H 'X-Bao-Require-Index: $BAO_IDX' ${SCHEME}://$STANDBY:8200/v1/secret/data/demo-secret | python3 -m json.tool"
 echo ""
 echo -e "${GREEN}Read served from standby with guaranteed consistency.${NC}"
 pause
@@ -99,7 +103,7 @@ echo "  - Per-node Raft applied index and replication lag"
 echo "  - Cluster health from autopilot (voters, non-voters, failure tolerance)"
 pause
 
-run "curl -s -H 'X-Vault-Token: $TOKEN' http://$LEADER:8200/v1/sys/ha-status | python3 -c \"
+run "$CURL -H 'X-Vault-Token: $TOKEN' ${SCHEME}://$LEADER:8200/v1/sys/ha-status | python3 -c \"
 import sys, json
 d = json.load(sys.stdin)
 ch = d.get('cluster_health', {})
@@ -117,7 +121,7 @@ header "5. LEADER FAILOVER"
 echo "Killing the current leader. Raft will elect a new one in ~3 seconds."
 pause
 
-CURRENT_LEADER=$(curl -s -H "X-Vault-Token: $TOKEN" http://$LEADER:8200/v1/sys/leader | python3 -c "import sys,json; print(json.load(sys.stdin).get('leader_address',''))" 2>/dev/null || echo "http://$LEADER:8200")
+CURRENT_LEADER=$($CURL -H "X-Vault-Token: $TOKEN" ${SCHEME}://$LEADER:8200/v1/sys/leader | python3 -c "import sys,json; print(json.load(sys.stdin).get('leader_address',''))" 2>/dev/null || echo "${SCHEME}://$LEADER:8200")
 echo -e "Current leader: ${RED}$CURRENT_LEADER${NC}"
 echo ""
 
@@ -128,7 +132,7 @@ sleep 8
 
 # Find the new leader
 for host in $STANDBY baoha-3.dnsif.ca; do
-    MODE=$(ssh altanc@$host "BAO_ADDR=http://127.0.0.1:8200 bao status 2>&1 | grep 'HA Mode'" | awk '{print $NF}')
+    MODE=$(ssh altanc@$host "BAO_ADDR=https://127.0.0.1:8200 BAO_CACERT=/opt/bao/tls/ca-cert.pem bao status 2>&1 | grep 'HA Mode'" | awk '{print $NF}')
     if [ "$MODE" = "active" ]; then
         NEW_LEADER=$host
         break
@@ -138,14 +142,14 @@ echo -e "New leader: ${GREEN}$NEW_LEADER${NC}"
 echo ""
 
 echo "Verifying data survived failover:"
-run "curl -s -H 'X-Vault-Token: $TOKEN' http://$NEW_LEADER:8200/v1/secret/data/demo-secret | python3 -c \"import sys,json; print(json.dumps(json.load(sys.stdin)['data']['data'], indent=2))\""
+run "$CURL -H 'X-Vault-Token: $TOKEN' ${SCHEME}://$NEW_LEADER:8200/v1/secret/data/demo-secret | python3 -c \"import sys,json; print(json.dumps(json.load(sys.stdin)['data']['data'], indent=2))\""
 pause
 
 # Bring the old leader back
 echo "Bringing old leader back as standby..."
 ssh altanc@$LEADER "sudo systemctl start bao" 2>/dev/null
 sleep 3
-ssh altanc@$LEADER "BAO_ADDR=http://127.0.0.1:8200 bao operator unseal $UNSEAL_KEY" > /dev/null 2>&1
+ssh altanc@$LEADER "BAO_ADDR=https://127.0.0.1:8200 BAO_CACERT=/opt/bao/tls/ca-cert.pem bao operator unseal $UNSEAL_KEY" > /dev/null 2>&1
 echo -e "${GREEN}Old leader rejoined as standby.${NC}"
 pause
 
@@ -155,7 +159,7 @@ echo "The non-voter node replicates all data but doesn't participate in"
 echo "leader elections. It's a disaster recovery standby."
 pause
 
-run "curl -s -H 'X-Vault-Token: $TOKEN' http://$DR_NODE:8200/v1/sys/storage/raft/dr-failover | python3 -m json.tool"
+run "$CURL -H 'X-Vault-Token: $TOKEN' ${SCHEME}://$DR_NODE:8200/v1/sys/storage/raft/dr-failover | python3 -m json.tool"
 pause
 
 # ──────────────────────────────────────────────────
