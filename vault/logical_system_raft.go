@@ -381,26 +381,30 @@ func (b *SystemBackend) handleRaftDRFailover() framework.OperationFunc {
 			return logical.ErrorResponse("could not find self in raft configuration"), logical.ErrInvalidRequest
 		}
 
-		// Create a new single-node cluster configuration with this node as a voter.
-		peer := raft.Peer{
-			ID:      nodeID,
-			Address: selfAddr,
+		b.Core.logger.Warn("DR failover: writing recovery peers.json", "node_id", nodeID, "address", selfAddr)
+
+		// Write a peers.json file that reconfigures the cluster with just
+		// this node as the only voter. On restart, Raft will read this file,
+		// call RecoverCluster, and this node will become the leader.
+		if err := raftBackend.WriteDRRecoveryPeers(nodeID, selfAddr); err != nil {
+			return nil, fmt.Errorf("failed to write recovery peers.json: %w", err)
 		}
 
-		b.Core.logger.Warn("DR failover: recovering cluster as single-node", "node_id", nodeID, "address", selfAddr)
+		b.Core.logger.Warn("DR failover: peers.json written, triggering shutdown for recovery restart", "node_id", nodeID)
 
-		if err := raftBackend.StartRecoveryCluster(ctx, peer); err != nil {
-			return nil, fmt.Errorf("failed to recover cluster: %w", err)
-		}
-
-		b.Core.logger.Warn("DR failover: cluster recovered, node is now leader", "node_id", nodeID)
+		// Schedule a graceful shutdown so the node restarts with the new config.
+		// The systemd service has Restart=on-failure, so it will come back up.
+		go func() {
+			time.Sleep(1 * time.Second)
+			b.Core.Shutdown()
+		}()
 
 		return &logical.Response{
 			Data: map[string]interface{}{
 				"success":  true,
 				"node_id":  nodeID,
-				"message":  "DR failover completed. This node is now the cluster leader.",
-				"warning":  "Ensure old voter nodes do not rejoin without being wiped. Run 'bao operator raft list-peers' to verify.",
+				"message":  "DR failover initiated. peers.json written. Node will restart in ~1s and become cluster leader.",
+				"warning":  "Ensure old voter nodes do not rejoin without being wiped. The node will unseal automatically if using auto-unseal; otherwise you must unseal it manually after restart.",
 			},
 		}, nil
 	}

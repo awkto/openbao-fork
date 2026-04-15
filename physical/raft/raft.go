@@ -1193,6 +1193,37 @@ func (b *RaftBackend) AppliedIndex() uint64 {
 	return indexState.Index
 }
 
+// WriteDRRecoveryPeers writes a peers.json file to the Raft data directory
+// that will be consumed on the next startup to reconfigure the cluster.
+// This is used for DR failover: the non-voter writes a peers.json that
+// makes itself the only voter, then restarts to become leader.
+func (b *RaftBackend) WriteDRRecoveryPeers(nodeID, addr string) error {
+	b.l.RLock()
+	defer b.l.RUnlock()
+
+	raftPath := filepath.Join(b.dataDir, raftState)
+	peersFile := filepath.Join(raftPath, peersFileName)
+
+	peers := []map[string]interface{}{
+		{
+			"id":       nodeID,
+			"address":  addr,
+			"non_voter": false,
+		},
+	}
+
+	data, err := jsonutil.EncodeJSON(peers)
+	if err != nil {
+		return fmt.Errorf("failed to encode peers.json: %w", err)
+	}
+
+	if err := os.WriteFile(peersFile, data, 0o644); err != nil {
+		return fmt.Errorf("failed to write peers.json: %w", err)
+	}
+
+	return nil
+}
+
 // WaitForAppliedIndex blocks until the FSM's applied index reaches at least
 // the given index, or the context is cancelled. This is used by standby nodes
 // to ensure read-after-write consistency: a client can supply the index from
