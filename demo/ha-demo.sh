@@ -103,17 +103,12 @@ echo "  - Per-node Raft applied index and replication lag"
 echo "  - Cluster health from autopilot (voters, non-voters, failure tolerance)"
 pause
 
-run "$CURL -H 'X-Vault-Token: $TOKEN' ${SCHEME}://$LEADER:8200/v1/sys/ha-status | python3 -c \"
-import sys, json
-d = json.load(sys.stdin)
-ch = d.get('cluster_health', {})
-print(f'  Healthy:           {ch.get(\"healthy\")}')
-print(f'  Failure tolerance: {ch.get(\"failure_tolerance\")}')
-print(f'  Leader:            {ch.get(\"leader\")}')
-print(f'  Voters:            {ch.get(\"voters\")}')
-print(f'  Non-voters:        {ch.get(\"non_voters\")}')
-print(f'  Replication lag:   {ch.get(\"replication_lag\")}')
-\""
+echo -e "${GREEN}\$ curl ... /v1/sys/ha-status${NC}"
+$CURL -H "X-Vault-Token: $TOKEN" ${SCHEME}://$LEADER:8200/v1/sys/ha-status | python3 -c '
+import sys, json; d = json.load(sys.stdin); ch = d.get("cluster_health", {})
+for k in ["healthy","failure_tolerance","leader","voters","non_voters","replication_lag"]:
+    print("  %-21s %s" % (k+":", ch.get(k)))
+'
 pause
 
 # ──────────────────────────────────────────────────
@@ -121,7 +116,7 @@ header "5. LEADER FAILOVER"
 echo "Killing the current leader. Raft will elect a new one in ~3 seconds."
 pause
 
-CURRENT_LEADER=$($CURL -H "X-Vault-Token: $TOKEN" ${SCHEME}://$LEADER:8200/v1/sys/leader | python3 -c "import sys,json; print(json.load(sys.stdin).get('leader_address',''))" 2>/dev/null || echo "${SCHEME}://$LEADER:8200")
+CURRENT_LEADER=$($CURL -H "X-Vault-Token: $TOKEN" ${SCHEME}://$LEADER:8200/v1/sys/leader 2>/dev/null | python3 -c 'import sys,json; print(json.load(sys.stdin).get("leader_address",""))' 2>/dev/null || echo "${SCHEME}://$LEADER:8200")
 echo -e "Current leader: ${RED}$CURRENT_LEADER${NC}"
 echo ""
 
@@ -142,7 +137,8 @@ echo -e "New leader: ${GREEN}$NEW_LEADER${NC}"
 echo ""
 
 echo "Verifying data survived failover:"
-run "$CURL -H 'X-Vault-Token: $TOKEN' ${SCHEME}://$NEW_LEADER:8200/v1/secret/data/demo-secret | python3 -c \"import sys,json; print(json.dumps(json.load(sys.stdin)['data']['data'], indent=2))\""
+echo -e "${GREEN}\$ curl ... /v1/secret/data/demo-secret${NC}"
+$CURL -H "X-Vault-Token: $TOKEN" ${SCHEME}://$NEW_LEADER:8200/v1/secret/data/demo-secret | python3 -c 'import sys,json;print(json.dumps(json.load(sys.stdin)["data"]["data"],indent=2))'
 pause
 
 # Bring the old leader back
