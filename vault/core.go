@@ -1017,6 +1017,19 @@ func CreateCore(conf *CoreConfig) (*Core, error) {
 
 func coreInit(c *Core, conf *CoreConfig) error {
 	phys := conf.Physical
+
+	// Seal wrap layer sits BELOW the LRU cache so cache hits skip the seal
+	// round-trip entirely. Only entries flagged SealWrap=true by the caller
+	// get wrapped; all other traffic passes through unchanged. We also skip
+	// wiring this layer if DisableSealWrap is set (the operator explicitly
+	// turned it off) or if no auto-seal is configured (shamir-only deploys
+	// have no external wrapper to call into for extra encryption).
+	if !conf.DisableSealWrap && c.seal != nil && c.seal.GetAccess() != nil && c.seal.BarrierType() != vaultseal.WrapperTypeShamir {
+		sealWrapLogger := c.baseLogger.Named("storage.seal-wrap")
+		c.allLoggers = append(c.allLoggers, sealWrapLogger)
+		phys = NewSealWrappingBackend(phys, c.seal.GetAccess(), sealWrapLogger)
+	}
+
 	// Wrap the physical backend in a cache layer if enabled
 	cacheLogger := c.baseLogger.Named("storage.cache")
 	c.allLoggers = append(c.allLoggers, cacheLogger)
