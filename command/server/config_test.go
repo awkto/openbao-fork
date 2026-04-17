@@ -62,6 +62,12 @@ func TestParseStorage(t *testing.T) {
 	testParseStorageTemplate(t)
 }
 
+// TestParseExternalKeys tests parsing of 'external_keys "type" { ... }'
+// stanzas.
+func TestParseExternalKeys(t *testing.T) {
+	testParseExternalKeys(t)
+}
+
 func TestUnknownFieldValidation(t *testing.T) {
 	testUnknownFieldValidation(t)
 }

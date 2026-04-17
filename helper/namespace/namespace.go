@@ -45,6 +45,8 @@ type Namespace struct {
 	Locked         bool              `json:"-"`
 	UnlockKey      string            `json:"unlock_key" mapstructure:"unlock_key"`
 	CustomMetadata map[string]string `json:"custom_metadata" mapstructure:"custom_metadata"`
+	// External Key types allowed in the namespace.
+	ExternalKeyTypes []string `json:"external_key_types" mapstructure:"external_key_types"`
 }
 
 func (n *Namespace) String() string {
@@ -148,12 +150,13 @@ func (n *Namespace) Clone(withUnlock bool) *Namespace {
 	maps.Copy(meta, n.CustomMetadata)
 
 	data := &Namespace{
-		ID:             n.ID,
-		UUID:           n.UUID,
-		Path:           n.Path,
-		Tainted:        n.Tainted,
-		Locked:         n.Locked,
-		CustomMetadata: meta,
+		ID:               n.ID,
+		UUID:             n.UUID,
+		Path:             n.Path,
+		Tainted:          n.Tainted,
+		Locked:           n.Locked,
+		CustomMetadata:   meta,
+		ExternalKeyTypes: slices.Clone(n.ExternalKeyTypes),
 	}
 
 	if withUnlock {
@@ -199,6 +202,37 @@ func (n *Namespace) ValidateUUID(candidate string) error {
 	}
 
 	return nil
+}
+
+// ParseSpecifier parses a "namespace specifier" kind and value from a
+// colon-separated string. Valid namespace specifier kinds are: path, id, uuid.
+func ParseSpecifier(value string) (string, string, error) {
+	kind, value, ok := strings.Cut(value, ":")
+	if !ok {
+		return "", "", fmt.Errorf("invalid namespace specifier")
+	}
+	switch kind {
+	case "path", "id", "uuid":
+	default:
+		return "", "", fmt.Errorf("unknown namespace specifier kind: %q", kind)
+	}
+	return kind, value, nil
+}
+
+// CompareSpecifier returns true if the namespace matches the passed specifier
+// value, comparing by Path, ID and UUID respectively depending on the passed
+// kind. Also see [ParseSpecifier].
+func (n *Namespace) CompareSpecifier(kind, value string) bool {
+	switch kind {
+	case "path":
+		return n.Path == Canonicalize(value)
+	case "id":
+		return n.ID == value
+	case "uuid":
+		return n.UUID == value
+	default:
+		return false
+	}
 }
 
 // ContextWithNamespace adds the given namespace to the given context

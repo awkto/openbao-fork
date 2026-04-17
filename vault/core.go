@@ -374,7 +374,7 @@ type Core struct {
 	// token store is used to manage authentication tokens
 	tokenStore *TokenStore
 
-	// namespace Store is used to manage namespaces
+	// namespaceStore is used to manage namespaces
 	namespaceStore *NamespaceStore
 
 	// sealManager is used to manage seals per namespace
@@ -382,6 +382,9 @@ type Core struct {
 
 	// identityStore is used to manage client entities
 	identityStore *ident.IdentityStore
+
+	// externalKeys is used to manage External Keys
+	externalKeys *ExternalKeyRegistry
 
 	// metricsCh is used to stop the metrics streaming
 	metricsCh chan struct{}
@@ -2366,6 +2369,9 @@ func (readonlyUnsealStrategy) unsealShared(ctx context.Context, c *Core, standby
 	if err := c.setupNamespaceStore(ctx); err != nil {
 		return err
 	}
+	if err := c.setupExternalKeys(); err != nil {
+		return err
+	}
 	if err := c.loadMounts(ctx, standby); err != nil {
 		return err
 	}
@@ -2586,6 +2592,9 @@ func (c *Core) preSeal() error {
 	}
 	if err := c.teardownLoginMFA(); err != nil {
 		result = multierror.Append(result, fmt.Errorf("error tearing down login MFA: %w", err))
+	}
+	if err := c.teardownExternalKeys(); err != nil {
+		result = multierror.Append(result, fmt.Errorf("error tearing down external keys registry: %w", err))
 	}
 	if err := c.teardownNamespaceStore(); err != nil {
 		result = multierror.Append(result, fmt.Errorf("error tearing down namespace store: %w", err))
@@ -3657,6 +3666,15 @@ func (c *Core) ReloadIntrospectionEndpointEnabled() {
 	c.introspectionEnabledLock.Lock()
 	defer c.introspectionEnabledLock.Unlock()
 	c.introspectionEnabled = conf.EnableIntrospectionEndpoint
+}
+
+func (c *Core) ReloadExternalKeys() {
+	conf := c.rawConfig.Load()
+	if conf == nil {
+		return
+	}
+	// TODO(satoqz): Reload all affected external key configs.
+	// externalKeyStanzas := conf.(*server.Config).ExternalKeys
 }
 
 type PeerNode struct {
