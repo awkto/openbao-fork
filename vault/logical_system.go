@@ -3697,7 +3697,7 @@ func (b *SystemBackend) pathHashWrite(ctx context.Context, req *logical.Request,
 }
 
 func (b *SystemBackend) pathRandomWrite(_ context.Context, _ *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-	return random.HandleRandomAPI(d)
+	return random.HandleRandomAPI(d, b.GetRandomReader())
 }
 
 func hasMountAccess(ctx context.Context, acl *ACL, path string) bool {
