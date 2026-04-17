@@ -33,6 +33,18 @@ type Config struct {
 	// Pin is the user PIN for C_Login. Required for RNG on vendors that gate
 	// C_GenerateRandom behind a login (some HSMs do).
 	Pin string
+
+	// SkipLogin tells the Client to never call C_Login on its sessions. Use
+	// this when only unauthenticated operations (e.g. C_GenerateRandom on
+	// SoftHSM) are required, and another consumer of the same token — the
+	// main seal wrapper, a separate External Keys driver — wants to own the
+	// per-token login state exclusively.
+	//
+	// PKCS#11 login is token-wide in most vendors; opening sessions in two
+	// separate library contexts against the same token causes their
+	// independent C_Login calls to race. Leaving this false preserves the
+	// original single-consumer behaviour (always log in when Pin is set).
+	SkipLogin bool
 }
 
 // ErrHSMBuildRequired is returned by NewClient when OpenBao was built without

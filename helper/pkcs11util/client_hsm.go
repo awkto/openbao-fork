@@ -174,7 +174,7 @@ func (c *Client) acquire() (pkcs11.SessionHandle, error) {
 		return 0, &ErrHSMUnavailable{Op: "C_OpenSession", Err: err}
 	}
 
-	if c.cfg.Pin != "" {
+	if c.cfg.Pin != "" && !c.cfg.SkipLogin {
 		if err := c.ctx.Login(session, pkcs11.CKU_USER, c.cfg.Pin); err != nil {
 			var pErr pkcs11.Error
 			// CKR_USER_ALREADY_LOGGED_IN is benign: the underlying token
