@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"time"
 
@@ -270,6 +271,18 @@ func (d dynamicSystemView) ListVersionedPlugins(ctx context.Context, pluginType 
 }
 
 // OpenBao no longer uses mlock but MlockEnabled is retained for plugin compatibility.
+// GetRandomReader implements logical.EntropySystemView. It returns the
+// HSM-augmented reader only when the mount was enabled with
+// `external_entropy_access = true` AND the server has an entropy stanza
+// configured; otherwise it returns nil and the backend falls back to
+// crypto/rand.Reader via sdk/framework.Backend.GetRandomReader.
+func (d dynamicSystemView) GetRandomReader() io.Reader {
+	if d.mountEntry == nil || !d.mountEntry.ExternalEntropyAccess {
+		return nil
+	}
+	return d.core.externalEntropy
+}
+
 func (d dynamicSystemView) MlockEnabled() bool {
 	return false
 }
