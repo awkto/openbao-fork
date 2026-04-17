@@ -1193,6 +1193,94 @@ func (b *RaftBackend) AppliedIndex() uint64 {
 	return indexState.Index
 }
 
+// TransferLeadershipTo transfers Raft leadership to a specific server by ID.
+// This is used by version-gated leader election to ensure a newer-version
+// node wins the election rather than a random follower.
+func (b *RaftBackend) TransferLeadershipTo(targetID string) error {
+	b.l.RLock()
+	defer b.l.RUnlock()
+
+	if b.raft == nil {
+		return errors.New("raft not initialized")
+	}
+
+	// Look up the server's address from the current Raft configuration.
+	configFuture := b.raft.GetConfiguration()
+	if err := configFuture.Error(); err != nil {
+		return fmt.Errorf("failed to get raft configuration: %w", err)
+	}
+	var targetAddr raft.ServerAddress
+	for _, srv := range configFuture.Configuration().Servers {
+		if string(srv.ID) == targetID {
+			targetAddr = srv.Address
+			break
+		}
+	}
+	if targetAddr == "" {
+		return fmt.Errorf("server %s not found in raft configuration", targetID)
+	}
+
+	future := b.raft.LeadershipTransferToServer(raft.ServerID(targetID), targetAddr)
+	return future.Error()
+}
+
+// WriteDRRecoveryPeers writes a peers.json file to the Raft data directory
+// that will be consumed on the next startup to reconfigure the cluster.
+// This is used for DR failover: the non-voter writes a peers.json that
+// makes itself the only voter, then restarts to become leader.
+func (b *RaftBackend) WriteDRRecoveryPeers(nodeID, addr string) error {
+	b.l.RLock()
+	defer b.l.RUnlock()
+
+	raftPath := filepath.Join(b.dataDir, raftState)
+	peersFile := filepath.Join(raftPath, peersFileName)
+
+	peers := []map[string]interface{}{
+		{
+			"id":       nodeID,
+			"address":  addr,
+			"non_voter": false,
+		},
+	}
+
+	data, err := jsonutil.EncodeJSON(peers)
+	if err != nil {
+		return fmt.Errorf("failed to encode peers.json: %w", err)
+	}
+
+	if err := os.WriteFile(peersFile, data, 0o644); err != nil {
+		return fmt.Errorf("failed to write peers.json: %w", err)
+	}
+
+	return nil
+}
+
+// WaitForAppliedIndex blocks until the FSM's applied index reaches at least
+// the given index, or the context is cancelled. This is used by standby nodes
+// to ensure read-after-write consistency: a client can supply the index from
+// a prior write response and the standby will wait until that write has been
+// replicated and applied locally before serving the read.
+func (b *RaftBackend) WaitForAppliedIndex(ctx context.Context, index uint64) error {
+	// Fast path: already at or past the requested index.
+	if b.AppliedIndex() >= index {
+		return nil
+	}
+
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if b.AppliedIndex() >= index {
+				return nil
+			}
+		}
+	}
+}
+
 // Term returns the raft term of this node.
 func (b *RaftBackend) Term() uint64 {
 	b.l.RLock()

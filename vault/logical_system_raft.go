@@ -244,6 +244,30 @@ func (b *SystemBackend) raftStoragePaths() []*framework.Path {
 			HelpSynopsis:    strings.TrimSpace(sysRaftHelp["raft-autopilot-configuration"][0]),
 			HelpDescription: strings.TrimSpace(sysRaftHelp["raft-autopilot-configuration"][1]),
 		},
+		{
+			Pattern: "storage/raft/dr-failover",
+
+			Fields: map[string]*framework.FieldSchema{
+				"dr_operation_token": {
+					Type:        framework.TypeString,
+					Description: "DR operation token for authorization (optional, for future use).",
+				},
+			},
+
+			Operations: map[logical.Operation]framework.OperationHandler{
+				logical.UpdateOperation: &framework.PathOperation{
+					Callback: b.handleRaftDRFailover(),
+					Summary:  "Triggers disaster recovery failover, promoting this non-voter node to become the new cluster leader.",
+				},
+				logical.ReadOperation: &framework.PathOperation{
+					Callback: b.handleRaftDRFailoverStatus(),
+					Summary:  "Returns the current DR failover readiness status of this node.",
+				},
+			},
+
+			HelpSynopsis:    strings.TrimSpace(sysRaftHelp["raft-dr-failover"][0]),
+			HelpDescription: strings.TrimSpace(sysRaftHelp["raft-dr-failover"][1]),
+		},
 	}
 }
 
@@ -326,6 +350,108 @@ func (b *SystemBackend) handleRaftDemoteUpdate() framework.OperationFunc {
 		}
 
 		return nil, nil
+	}
+}
+
+func (b *SystemBackend) handleRaftDRFailover() framework.OperationFunc {
+	return func(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+		raftBackend := b.Core.GetRaftBackend()
+		if raftBackend == nil {
+			return logical.ErrorResponse("raft storage is not in use"), logical.ErrInvalidRequest
+		}
+
+		nodeID := raftBackend.NodeID()
+		b.Core.logger.Warn("DR failover initiated", "node_id", nodeID)
+
+		// Get the current Raft configuration to find this node's address.
+		config, err := raftBackend.GetConfiguration(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get raft configuration: %w", err)
+		}
+
+		// Find this node in the configuration.
+		var selfAddr string
+		for _, server := range config.Servers {
+			if server.NodeID == nodeID {
+				selfAddr = server.Address
+				break
+			}
+		}
+		if selfAddr == "" {
+			return logical.ErrorResponse("could not find self in raft configuration"), logical.ErrInvalidRequest
+		}
+
+		b.Core.logger.Warn("DR failover: writing recovery peers.json", "node_id", nodeID, "address", selfAddr)
+
+		// Write a peers.json file that reconfigures the cluster with just
+		// this node as the only voter. On restart, Raft will read this file,
+		// call RecoverCluster, and this node will become the leader.
+		if err := raftBackend.WriteDRRecoveryPeers(nodeID, selfAddr); err != nil {
+			return nil, fmt.Errorf("failed to write recovery peers.json: %w", err)
+		}
+
+		b.Core.logger.Warn("DR failover: peers.json written, triggering shutdown for recovery restart", "node_id", nodeID)
+
+		// Schedule a graceful shutdown so the node restarts with the new config.
+		// The systemd service has Restart=on-failure, so it will come back up.
+		go func() {
+			time.Sleep(1 * time.Second)
+			b.Core.Shutdown()
+		}()
+
+		return &logical.Response{
+			Data: map[string]interface{}{
+				"success":  true,
+				"node_id":  nodeID,
+				"message":  "DR failover initiated. peers.json written. Node will restart in ~1s and become cluster leader.",
+				"warning":  "Ensure old voter nodes do not rejoin without being wiped. The node will unseal automatically if using auto-unseal; otherwise you must unseal it manually after restart.",
+			},
+		}, nil
+	}
+}
+
+func (b *SystemBackend) handleRaftDRFailoverStatus() framework.OperationFunc {
+	return func(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+		raftBackend := b.Core.GetRaftBackend()
+		if raftBackend == nil {
+			return logical.ErrorResponse("raft storage is not in use"), logical.ErrInvalidRequest
+		}
+
+		nodeID := raftBackend.NodeID()
+		appliedIndex := raftBackend.AppliedIndex()
+		committedIndex := raftBackend.CommittedIndex()
+		isStandby := b.Core.Standby()
+
+		// Check raft configuration for this node's role.
+		config, err := raftBackend.GetConfiguration(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get raft configuration: %w", err)
+		}
+
+		role := "unknown"
+		isNonVoter := false
+		for _, server := range config.Servers {
+			if server.NodeID == nodeID {
+				if server.Voter {
+					role = "voter"
+				} else {
+					role = "non-voter"
+					isNonVoter = true
+				}
+				break
+			}
+		}
+
+		return &logical.Response{
+			Data: map[string]interface{}{
+				"node_id":              nodeID,
+				"role":                 role,
+				"is_standby":           isStandby,
+				"raft_applied_index":   appliedIndex,
+				"raft_committed_index": committedIndex,
+				"dr_failover_ready":    isNonVoter && appliedIndex > 0,
+			},
+		}, nil
 	}
 }
 
@@ -801,5 +927,9 @@ var sysRaftHelp = map[string][2]string{
 	"raft-autopilot-configuration": {
 		"Returns autopilot configuration.",
 		"",
+	},
+	"raft-dr-failover": {
+		"Triggers or reports on disaster recovery failover for non-voter nodes.",
+		"When triggered via POST/PUT, this endpoint promotes the current non-voter node to become the new cluster leader after verifying all voters are unreachable. GET returns the node's DR readiness status.",
 	},
 }

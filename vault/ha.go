@@ -18,6 +18,7 @@ import (
 	metrics "github.com/hashicorp/go-metrics/compat"
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/go-uuid"
+	semver "github.com/hashicorp/go-version"
 	"github.com/oklog/run"
 	"github.com/openbao/openbao/helper/namespace"
 	"github.com/openbao/openbao/sdk/v2/helper/certutil"
@@ -73,24 +74,55 @@ func (c *Core) getHAMembers() ([]HAStatusNode, error) {
 		ClusterAddress: c.ClusterAddr(),
 		ActiveNode:     true,
 		Version:        c.effectiveSDKVersion,
+		Healthy:        true,
+		Role:           "voter",
 	}
 
+	var leaderAppliedIndex uint64
 	if rb := c.GetRaftBackend(); rb != nil {
 		leader.UpgradeVersion = rb.EffectiveVersion()
+		leaderAppliedIndex = rb.AppliedIndex()
+		leader.RaftAppliedIndex = leaderAppliedIndex
 	}
 
 	nodes := []HAStatusNode{leader}
 
+	// Build follower states map for replication lag calculation.
+	var followerIndexes map[string]uint64
+	if c.raftFollowerStates != nil {
+		followerIndexes = make(map[string]uint64)
+		for nodeID, state := range c.raftFollowerStates.GetAll() {
+			followerIndexes[nodeID] = state.AppliedIndex
+		}
+	}
+
 	for _, peerNode := range c.GetHAPeerNodesCached() {
 		lastEcho := peerNode.LastEcho
-		nodes = append(nodes, HAStatusNode{
+		node := HAStatusNode{
 			Hostname:       peerNode.Hostname,
 			APIAddress:     peerNode.APIAddress,
 			ClusterAddress: peerNode.ClusterAddress,
 			LastEcho:       &lastEcho,
 			Version:        peerNode.Version,
 			UpgradeVersion: peerNode.UpgradeVersion,
-		})
+			Role:           "voter",
+		}
+
+		// Look up the follower's applied index for replication lag.
+		if followerIndexes != nil {
+			for nodeID, idx := range followerIndexes {
+				if strings.Contains(peerNode.ClusterAddress, nodeID) || peerNode.Hostname == nodeID {
+					node.RaftAppliedIndex = idx
+					if leaderAppliedIndex > idx {
+						node.ReplicationLag = leaderAppliedIndex - idx
+					}
+					node.Healthy = (leaderAppliedIndex-idx) < 1000 && time.Since(lastEcho) < 10*time.Second
+					break
+				}
+			}
+		}
+
+		nodes = append(nodes, node)
 	}
 
 	sort.Slice(nodes, func(i, j int) bool {
@@ -98,6 +130,41 @@ func (c *Core) getHAMembers() ([]HAStatusNode, error) {
 	})
 
 	return nodes, nil
+}
+
+// getClusterHealth returns a summary of the Raft cluster health from autopilot.
+func (c *Core) getClusterHealth() *ClusterHealthSummary {
+	rb := c.GetRaftBackend()
+	if rb == nil {
+		return nil
+	}
+
+	state, err := rb.GetAutopilotServerState(context.Background())
+	if err != nil || state == nil {
+		return nil
+	}
+
+	summary := &ClusterHealthSummary{
+		Healthy:          state.Healthy,
+		FailureTolerance: state.FailureTolerance,
+		Leader:           state.Leader,
+		Voters:           state.Voters,
+		NonVoters:        state.NonVoters,
+		ReplicationLag:   make(map[string]uint64),
+	}
+
+	leaderIdx := rb.AppliedIndex()
+	if c.raftFollowerStates != nil {
+		for nodeID, fState := range c.raftFollowerStates.GetAll() {
+			if leaderIdx > fState.AppliedIndex {
+				summary.ReplicationLag[nodeID] = leaderIdx - fState.AppliedIndex
+			} else {
+				summary.ReplicationLag[nodeID] = 0
+			}
+		}
+	}
+
+	return summary
 }
 
 // Leader is used to get information about the current active leader in relation to the current node (core).
@@ -799,6 +866,58 @@ func (c *Core) waitForLeadership(manualStepDownCh, stopCh <-chan struct{}) {
 			continue
 		}
 
+		// Version-gated leader election: now that we're fully active and
+		// the cluster forwarding is established, periodically check if a
+		// newer-version follower exists. If so, transfer leadership directly
+		// to that node using Raft's LeadershipTransferToServer.
+		if c.raftFollowerStates != nil {
+			go func() {
+				myVersion, myErr := semver.NewVersion(c.effectiveSDKVersion)
+				if myErr != nil {
+					return
+				}
+				// Check 4 times over 60s (at 15s, 30s, 45s, 60s).
+				for attempt := 1; attempt <= 4; attempt++ {
+					time.Sleep(15 * time.Second)
+					for nodeID, state := range c.raftFollowerStates.GetAll() {
+						if state.UpgradeVersion == "" {
+							continue
+						}
+						theirVersion, err := semver.NewVersion(state.UpgradeVersion)
+						if err != nil {
+							continue
+						}
+						if theirVersion.GreaterThan(myVersion) {
+							c.logger.Warn("version-gated leader election: transferring leadership to newer node",
+								"my_version", myVersion.String(),
+								"newer_node", nodeID,
+								"newer_version", theirVersion.String(),
+								"check_attempt", attempt)
+							// Use Raft's targeted leadership transfer to ensure
+							// the newer node specifically wins the election.
+							if rb := c.GetRaftBackend(); rb != nil {
+								if err := rb.TransferLeadershipTo(nodeID); err != nil {
+									c.logger.Error("version-gated leader election: transfer failed, falling back to step-down",
+										"error", err)
+									select {
+									case c.manualStepDownCh <- struct{}{}:
+									default:
+									}
+								}
+							}
+							return
+						}
+					}
+					c.logger.Debug("version-gated leader election: no newer node found",
+						"my_version", myVersion.String(),
+						"check_attempt", attempt,
+						"followers", len(c.raftFollowerStates.GetAll()))
+				}
+				c.logger.Info("version-gated leader election: confirmed newest version after all checks",
+					"my_version", myVersion.String())
+			}()
+		}
+
 		// Monitor a loss of leadership
 		select {
 		case <-leaderLostCh:
@@ -1272,4 +1391,41 @@ func (c *Core) StandbyReadsEnabled() bool {
 		return false
 	}
 	return !conf.DisableStandbyReads
+}
+
+const (
+	// BaoIndexHeaderName is the response header containing the Raft applied
+	// index at the time a write was committed on the active node. Clients
+	// can capture this value and send it back as BaoRequireIndexHeaderName
+	// on subsequent reads to achieve read-after-write consistency.
+	BaoIndexHeaderName = "X-Bao-Index"
+
+	// BaoRequireIndexHeaderName is the request header a client sends to ask
+	// a standby node to wait until its local Raft applied index reaches at
+	// least the given value before serving the read. If the standby cannot
+	// reach the index within the configured timeout it forwards the request
+	// to the active node instead.
+	BaoRequireIndexHeaderName = "X-Bao-Require-Index"
+
+	// DefaultRequireIndexTimeout is the default timeout for waiting for
+	// a Raft index on a standby node before forwarding to the active.
+	DefaultRequireIndexTimeout = 5 * time.Second
+)
+
+// WaitForIndex blocks until the local Raft applied index is >= the
+// requested index. Returns nil on success, context.DeadlineExceeded
+// or context.Canceled on timeout/cancel.
+func (c *Core) WaitForIndex(ctx context.Context, index uint64) error {
+	raftBackend := c.GetRaftBackend()
+	if raftBackend == nil {
+		return fmt.Errorf("wait-for-index requires raft storage backend")
+	}
+	return raftBackend.WaitForAppliedIndex(ctx, index)
+}
+
+// GetCurrentIndex returns the current Raft applied index for this node.
+// Returns 0 if not using Raft.
+func (c *Core) GetCurrentIndex() uint64 {
+	_, applied := c.GetRaftIndexes()
+	return applied
 }

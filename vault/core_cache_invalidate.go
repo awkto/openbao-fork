@@ -371,6 +371,20 @@ func (ij *invalidationJob) Execute() error {
 	case key == coreAuditConfigPath || key == coreLocalAuditConfigPath:
 		ij.fatal = true
 		return ij.auditInvalidation(ctx)
+	case key == systemBarrierPrefix+"config/cors":
+		// CORS config changed on the active node; reload it.
+		ij.im.dispacherLogger.Trace("invalidating CORS config")
+		return ij.im.core.loadCORSConfig(ctx)
+	case strings.HasPrefix(key, systemBarrierPrefix+"login-mfa/"):
+		// MFA method or enforcement config changed; reload all MFA configs.
+		ij.im.dispacherLogger.Trace("invalidating login MFA configs", "key", key)
+		return ij.im.core.loadLoginMFAConfigs(ctx)
+	case strings.HasPrefix(key, systemBarrierPrefix+"mfa/"):
+		// MFA TOTP key or other MFA data changed.
+		ij.im.dispacherLogger.Trace("invalidating MFA data", "key", key)
+		// MFA TOTP keys are per-entity and looked up on demand; no cached
+		// state to invalidate beyond what loadLoginMFAConfigs covers.
+		return nil
 	case isLegacyMountPath(key):
 		ij.fatal = true
 		return ij.legacyMountInvalidation(ctx)
