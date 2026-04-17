@@ -96,6 +96,15 @@ func BuildEntropyAugmenter(cfg *configutil.SharedConfig, logger hclog.Logger) (*
 		return nil, nil, fmt.Errorf("entropy: %w", err)
 	}
 
+	// Entropy augmenter only calls C_GenerateRandom, which is available
+	// without login on every HSM we care about. Skipping login avoids
+	// racing the main seal wrapper + External Keys drivers on the
+	// token-wide login state (PKCS#11 treats login as token-scoped; two
+	// wrappers logging into the same token on SoftHSM fail with
+	// CKR_USER_ALREADY_LOGGED_IN). Discovered in hsm-full integration
+	// testing (issue #9).
+	p11cfg.SkipLogin = true
+
 	client, err := pkcs11util.NewClient(p11cfg)
 	if err != nil {
 		return nil, nil, fmt.Errorf("entropy: could not open PKCS#11 client: %w", err)
