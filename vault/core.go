@@ -237,6 +237,15 @@ type Core struct {
 	// seal is our seal, for seal configuration information
 	seal Seal
 
+	// externalEntropy, when non-nil, is the reader handed to mounts with
+	// `external_entropy_access = true`. It blends HSM-derived bytes with the
+	// OS PRNG; see vault.BuildEntropyAugmenter.
+	externalEntropy io.Reader
+
+	// externalEntropyClient owns the underlying PKCS#11 session and is
+	// closed during core shutdown.
+	externalEntropyClient io.Closer
+
 	// raftJoinDoneCh is used by the raft retry join routine to inform unseal process
 	// that the join is complete
 	raftJoinDoneCh chan struct{}
@@ -682,6 +691,16 @@ type CoreConfig struct {
 	// seal in migration scenarios.
 	UnwrapSeal Seal
 
+	// ExternalEntropy, when non-nil, is a reader that blends HSM-derived
+	// bytes with the OS PRNG. It is handed out to mounts that opt in via
+	// `external_entropy_access = true`. See helper/pkcs11util and vault.
+	// BuildEntropyAugmenter for the construction path.
+	ExternalEntropy io.Reader
+
+	// ExternalEntropyClient owns the PKCS#11 session backing ExternalEntropy.
+	// Core calls Close on it during shutdown.
+	ExternalEntropyClient io.Closer
+
 	LogLevel string
 
 	Logger log.Logger
@@ -898,6 +917,9 @@ func CreateCore(conf *CoreConfig) (*Core, error) {
 		storageType:         conf.StorageType,
 		redirectAddr:        conf.RedirectAddr,
 		seal:                conf.Seal,
+
+		externalEntropy:       conf.ExternalEntropy,
+		externalEntropyClient: conf.ExternalEntropyClient,
 		stateLock:           stateLock,
 		router:              routing.NewRouter(routerLogger),
 		baseLogger:          conf.Logger,
@@ -1340,6 +1362,15 @@ func (c *Core) Shutdown() error {
 
 	c.stateLock.Lock()
 	defer c.stateLock.Unlock()
+
+	// Release any HSM session owned by the entropy augmenter. This is
+	// idempotent and safe to call whether or not entropy was configured.
+	if c.externalEntropyClient != nil {
+		if cerr := c.externalEntropyClient.Close(); cerr != nil {
+			c.logger.Warn("error closing entropy augmenter", "error", cerr)
+		}
+		c.externalEntropyClient = nil
+	}
 
 	doneCh := c.shutdownDoneCh.Load().(chan struct{})
 	if doneCh != nil {

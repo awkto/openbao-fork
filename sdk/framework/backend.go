@@ -398,8 +398,21 @@ func (b *Backend) Setup(ctx context.Context, config *logical.BackendConfig) erro
 	return nil
 }
 
-// GetRandomReader returns crypto/rand.Reader.
+// GetRandomReader returns the io.Reader backends should use for cryptographic
+// randomness. By default this is crypto/rand.Reader; if the mount has
+// `external_entropy_access = true` AND the server has an entropy augmentation
+// source configured, the system view returns a reader that blends HSM-derived
+// bytes with /dev/urandom. Callers that need to stream bytes (e.g. sys/tools/
+// random with source=seal) should ALWAYS go through this method so the
+// blending decision happens in one place.
 func (b *Backend) GetRandomReader() io.Reader {
+	if b.system != nil {
+		if ev, ok := b.system.(logical.EntropySystemView); ok {
+			if r := ev.GetRandomReader(); r != nil {
+				return r
+			}
+		}
+	}
 	return rand.Reader
 }
 

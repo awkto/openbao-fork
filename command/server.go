@@ -1122,7 +1122,19 @@ func (c *ServerCommand) Run(args []string) int {
 		return 1
 	}
 
+	entropyClient, entropyReader, err := vault.BuildEntropyAugmenter(config.SharedConfig, c.logger)
+	if err != nil {
+		c.UI.Error(err.Error())
+		return 1
+	}
+	if entropyClient != nil {
+		info["entropy augmentation"] = "pkcs11 seal (augmentation)"
+		infoKeys = append(infoKeys, "entropy augmentation")
+	}
+
 	coreConfig := createCoreConfig(c, config, backend, configSR, barrierSeal, unwrapSeal, metricsHelper, metricSink)
+	coreConfig.ExternalEntropy = entropyReader
+	coreConfig.ExternalEntropyClient = entropyClient
 	if c.flagDevThreeNode {
 		return c.enableThreeNodeDevCluster(&coreConfig, info, infoKeys, c.flagDevListenAddr, api.ReadBaoVariable("BAO_DEV_TEMP_DIR"))
 	}
