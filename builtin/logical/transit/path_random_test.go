@@ -86,27 +86,38 @@ func TestTransit_Random(t *testing.T) {
 	}
 
 	for _, source := range []string{"", "platform", "seal", "all"} {
+		// source=seal requires a configured entropy augmenter; the test
+		// harness doesn't wire one, so every seal-backed call must error
+		// rather than silently fall through to /dev/urandom (issue #15).
+		// Note the path-based calls (random, random/24) don't actually
+		// forward "source" to the body — the URL override is empty — so
+		// only the explicit random/<source> forms pin source=seal.
+		sealSourceErrs := source == "seal"
+
 		req.Data["source"] = source
 		req.Data["bytes"] = 32
 		req.Data["format"] = "base64"
 		req.Path = "random"
-		// Test defaults
+		// Test defaults (URL has no source, body's source is replaced with
+		// URL's empty, so this is always platform).
 		doRequest(req, false, "base64", 32)
 
-		// Test size selection in the path
+		// Test size selection in the path (same reasoning — URL overrides
+		// body source with empty).
 		req.Path = "random/24"
 		req.Data["format"] = "hex"
 		doRequest(req, false, "hex", 24)
 
 		if source != "" {
-			// Test source selection in the path
+			// Test source selection in the path — this is the one that
+			// actually pins source=seal when the loop variable is "seal".
 			req.Path = fmt.Sprintf("random/%s", source)
 			req.Data["format"] = "hex"
-			doRequest(req, false, "hex", 32)
+			doRequest(req, sealSourceErrs, "hex", 32)
 
 			req.Path = fmt.Sprintf("random/%s/24", source)
 			req.Data["format"] = "hex"
-			doRequest(req, false, "hex", 24)
+			doRequest(req, sealSourceErrs, "hex", 24)
 		}
 
 		// Test bad input/format

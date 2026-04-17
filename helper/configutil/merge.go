@@ -19,6 +19,11 @@ func (c *SharedConfig) Merge(c2 *SharedConfig) *SharedConfig {
 	result.Seals = append(result.Seals, c.Seals...)
 	result.Seals = append(result.Seals, c2.Seals...)
 
+	result.Entropy = c.Entropy
+	if c2.Entropy != nil {
+		result.Entropy = c2.Entropy
+	}
+
 	result.Telemetry = c.Telemetry
 	if c2.Telemetry != nil {
 		result.Telemetry = c2.Telemetry

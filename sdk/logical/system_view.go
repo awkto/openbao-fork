@@ -108,6 +108,20 @@ type ExtendedSystemView interface {
 	APILockShouldBlockRequest() (bool, error)
 }
 
+// EntropySystemView is an optional SystemView extension. When the backend's
+// mount has `external_entropy_access = true` AND the server has an entropy
+// augmentation source configured (e.g. `entropy "seal" { mode =
+// "augmentation" }`), EntropyReader returns a reader that blends HSM-derived
+// bytes with the OS PRNG. In every other case it returns nil, and callers
+// should fall back to crypto/rand.Reader.
+//
+// Implementations must return nil (never an error reader) when augmentation
+// is unavailable, so that backends can treat "no entropy view" and "entropy
+// view without augmentation" identically.
+type EntropySystemView interface {
+	GetRandomReader() io.Reader
+}
+
 type PasswordGenerator func() (password string, err error)
 
 type StaticSystemView struct {

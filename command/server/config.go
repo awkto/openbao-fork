@@ -25,6 +25,7 @@ import (
 	"github.com/hashicorp/hcl/hcl/ast"
 	"github.com/openbao/openbao/api/v2"
 	"github.com/openbao/openbao/helper/configutil"
+	"github.com/openbao/openbao/helper/namespace"
 	"github.com/openbao/openbao/helper/osutil"
 	"github.com/openbao/openbao/helper/profiles"
 	"github.com/openbao/openbao/sdk/v2/helper/consts"
@@ -52,6 +53,8 @@ type Config struct {
 	HAStorage *Storage `hcl:"-"`
 
 	ServiceRegistration *ServiceRegistration `hcl:"-"`
+
+	ExternalKeys map[string]*ExternalKeysConfig `hcl:"-"`
 
 	CacheSize                int         `hcl:"cache_size"`
 	DisableCache             bool        `hcl:"-"`
@@ -462,6 +465,28 @@ func parsePlugins(name string, list *ast.ObjectList) ([]*PluginConfig, error) {
 	return result, nil
 }
 
+// ExternalKeys is the server-level configuration for External Keys.
+type ExternalKeysConfig struct {
+	Type       string                // Type of external_keys stanza, e.g. "pkcs11".
+	Values     map[string]string     // Type-specific parameters, e.g. lib="/usr/lib/..." for type "pkcs11".
+	Namespaces []*NamespaceSpecifier // Namespaces to enable this configuration in.
+}
+
+func (e *ExternalKeysConfig) GoString() string {
+	return fmt.Sprintf("*%#v", *e)
+}
+
+// NamespaceSpecifier references a namespace to whitelist as part of an
+// [ExternalKeysConfig] configuration. Also see [namespace.ParseSpecifier].
+type NamespaceSpecifier struct {
+	Kind  string // One of "path", "id", "uuid".
+	Value string // Matching value for Kind.
+}
+
+func (n *NamespaceSpecifier) GoString() string {
+	return fmt.Sprintf("*%#v", *n)
+}
+
 func NewConfig() *Config {
 	return &Config{
 		SharedConfig: new(configutil.SharedConfig),
@@ -495,6 +520,9 @@ func (c *Config) Merge(c2 *Config) *Config {
 	if c2.ServiceRegistration != nil {
 		result.ServiceRegistration = c2.ServiceRegistration
 	}
+
+	result.ExternalKeys = c.ExternalKeys
+	maps.Copy(result.ExternalKeys, c2.ExternalKeys)
 
 	result.CacheSize = c.CacheSize
 	if c2.CacheSize != 0 {
@@ -1037,6 +1065,14 @@ func ParseConfig(d, source string) (*Config, error) {
 		result.PluginAutoRegister = autoRegister
 	}
 
+	// Parse external keys stanzas.
+	if o := list.Filter("external_keys"); len(o.Items) > 0 {
+		delete(result.UnusedKeys, "external_keys")
+		if err := parseExternalKeys(result, o, "external_keys"); err != nil {
+			return nil, fmt.Errorf("error parsing 'external_keys': %w", err)
+		}
+	}
+
 	// Remove all unused keys from Config that were satisfied by SharedConfig.
 	result.UnusedKeys = configutil.UnusedFieldDifference(result.UnusedKeys, nil, append(result.FoundKeys, sharedConfig.FoundKeys...))
 	// Assign file info
@@ -1314,6 +1350,73 @@ func parseServiceRegistration(result *Config, list *ast.ObjectList, name string)
 	return nil
 }
 
+func parseExternalKeys(result *Config, list *ast.ObjectList, blockName string) error {
+	cfgs := make(map[string]*ExternalKeysConfig)
+	for _, item := range list.Items {
+		var e ExternalKeysConfig
+
+		// We expect 'external_keys "type" { ... }'
+		if len(item.Keys) != 1 {
+			return fmt.Errorf("%s: expected exactly one key", blockName)
+		}
+		key := item.Keys[0].Token.Value().(string)
+		e.Type = strings.ToLower(key)
+
+		var m map[string]any
+		if err := hcl.DecodeObject(&m, item.Val); err != nil {
+			return fmt.Errorf("%s.%s: %w", blockName, key, err)
+		}
+
+		// Parse 'namespaces' array:
+		if v, ok := m["namespaces"]; ok {
+			namespaces, ok := v.([]any)
+			if !ok {
+				return fmt.Errorf("%s.%s: unable to parse 'namespaces', expected an array", blockName, key)
+			}
+			for idx, spec := range namespaces {
+				s, err := parseutil.ParseString(spec)
+				if err != nil {
+					return fmt.Errorf("%s.%s: unable to parse 'namespaces' at array index %d: %w", blockName, key, idx, err)
+				}
+				kind, value, err := namespace.ParseSpecifier(s)
+				if err != nil {
+					return fmt.Errorf("%s.%s: unable to parse 'namespaces' at array index %d: %w", blockName, key, idx, err)
+				}
+				e.Namespaces = append(e.Namespaces, &NamespaceSpecifier{Kind: kind, Value: value})
+			}
+			delete(m, "namespaces")
+		}
+		// Default an empty list of namespaces to the root namespace:
+		if len(e.Namespaces) == 0 {
+			e.Namespaces = append(e.Namespaces, &NamespaceSpecifier{Kind: "id", Value: namespace.RootNamespaceID})
+		}
+
+		// Convert all remaining fields to strings:
+		e.Values = make(map[string]string, len(m))
+		for k, v := range m {
+			s, err := parseutil.ParseString(v)
+			if err != nil {
+				return fmt.Errorf("%s.%s: %w", blockName, key, err)
+			}
+			e.Values[k] = s
+		}
+
+		name, ok := e.Values["name"]
+		if !ok {
+			return fmt.Errorf("%s.%s: missing 'name'", blockName, key)
+		}
+		delete(e.Values, "name")
+
+		if _, ok := cfgs[blockName]; ok {
+			return fmt.Errorf("%s.%s: duplicate 'name' %q", blockName, key, name)
+		}
+		cfgs[name] = &e
+	}
+
+	result.ExternalKeys = cfgs
+	return nil
+}
+
 // Sanitized returns a copy of the config with all values that are considered
 // sensitive stripped. It also strips all `*Raw` values that are mainly
 // used for parsing.
@@ -1323,6 +1426,8 @@ func parseServiceRegistration(result *Config, list *ast.ObjectList, name string)
 // - HAStorage.Config
 // - Seals.Config
 // - Telemetry.CirconusAPIToken
+// - ServiceRegistration.Config
+// - ExternalKeys[].Config
 func (c *Config) Sanitized() map[string]interface{} {
 	// Create shared config if it doesn't exist (e.g. in tests) so that map
 	// keys are actually populated
@@ -1426,6 +1531,7 @@ func (c *Config) Sanitized() map[string]interface{} {
 		result["service_registration"] = sanitizedServiceRegistration
 	}
 
+	// Sanitize audit stanzas
 	if len(c.Audits) > 0 {
 		var sanitizedAudits []map[string]interface{}
 		for _, a := range c.Audits {
@@ -1437,6 +1543,18 @@ func (c *Config) Sanitized() map[string]interface{} {
 			sanitizedAudits = append(sanitizedAudits, cfg)
 		}
 		result["audits"] = sanitizedAudits
+	}
+
+	// Sanitize external_keys stanzas
+	if len(c.ExternalKeys) != 0 {
+		var sanitizedExternalKeys []map[string]string
+		for name, e := range c.ExternalKeys {
+			sanitizedExternalKeys = append(sanitizedExternalKeys, map[string]string{
+				"name": name,
+				"type": e.Type,
+			})
+		}
+		result["external_keys"] = sanitizedExternalKeys
 	}
 
 	return result

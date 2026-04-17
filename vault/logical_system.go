@@ -155,6 +155,7 @@ func NewSystemBackend(core *Core, logger log.Logger) *SystemBackend {
 	b.Paths = append(b.Paths, b.loginMFAPaths()...)
 	b.Paths = append(b.Paths, b.introspectionPaths()...)
 	b.Paths = append(b.Paths, b.workflowPaths()...)
+	b.Paths = append(b.Paths, b.externalKeyPaths()...)
 
 	if core.rawEnabled {
 		b.Paths = append(b.Paths, b.rawPaths()...)
@@ -3697,7 +3698,7 @@ func (b *SystemBackend) pathHashWrite(ctx context.Context, req *logical.Request,
 }
 
 func (b *SystemBackend) pathRandomWrite(_ context.Context, _ *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-	return random.HandleRandomAPI(d)
+	return random.HandleRandomAPI(d, b.GetRandomReader())
 }
 
 func hasMountAccess(ctx context.Context, acl *ACL, path string) bool {
@@ -5646,5 +5647,17 @@ This path responds to the following HTTP methods.
 	PUT /<path>
 		Execute a workflow.
 		`,
+	},
+	"namespaces-external-keys": {
+		"Manage the External Key types allowed in a namespace.",
+		`
+This path responds to the following HTTP methods.
+
+	GET /<path>/external-keys
+		Retrieve the allowed External Key types for a namespace.
+
+	PUT /<path>/external-keys
+		Update the allowed External Key types for a namespace.
+			`,
 	},
 }

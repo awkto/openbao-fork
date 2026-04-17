@@ -32,6 +32,11 @@ type SharedConfig struct {
 
 	Seals []*KMS `hcl:"-"`
 
+	// Entropy is the optional `entropy "seal" { mode = "augmentation" }`
+	// stanza. When set, randomness for mounts with external entropy access
+	// is drawn from the configured PKCS#11 seal and mixed with the OS PRNG.
+	Entropy *Entropy `hcl:"-"`
+
 	// mlock is no longer used by OpenBao, but this is kept as a config option for
 	// compatibility's sake and to give a warning for those expecting it.
 	DisableMlockRaw interface{} `hcl:"disable_mlock"`
@@ -113,6 +118,13 @@ func ParseConfig(d string) (*SharedConfig, error) {
 		result.found("kms", "Seal")
 		if err := parseKMS(&result.Seals, o, "kms", 3); err != nil {
 			return nil, fmt.Errorf("error parsing 'kms': %w", err)
+		}
+	}
+
+	if o := list.Filter("entropy"); len(o.Items) > 0 {
+		result.found("entropy", "Entropy")
+		if err := parseEntropy(&result, o, "entropy"); err != nil {
+			return nil, fmt.Errorf("error parsing 'entropy': %w", err)
 		}
 	}
 

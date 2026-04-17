@@ -237,6 +237,15 @@ type Core struct {
 	// seal is our seal, for seal configuration information
 	seal Seal
 
+	// externalEntropy, when non-nil, is the reader handed to mounts with
+	// `external_entropy_access = true`. It blends HSM-derived bytes with the
+	// OS PRNG; see vault.BuildEntropyAugmenter.
+	externalEntropy io.Reader
+
+	// externalEntropyClient owns the underlying PKCS#11 session and is
+	// closed during core shutdown.
+	externalEntropyClient io.Closer
+
 	// raftJoinDoneCh is used by the raft retry join routine to inform unseal process
 	// that the join is complete
 	raftJoinDoneCh chan struct{}
@@ -365,7 +374,7 @@ type Core struct {
 	// token store is used to manage authentication tokens
 	tokenStore *TokenStore
 
-	// namespace Store is used to manage namespaces
+	// namespaceStore is used to manage namespaces
 	namespaceStore *NamespaceStore
 
 	// sealManager is used to manage seals per namespace
@@ -373,6 +382,9 @@ type Core struct {
 
 	// identityStore is used to manage client entities
 	identityStore *ident.IdentityStore
+
+	// externalKeys is used to manage External Keys
+	externalKeys *ExternalKeyRegistry
 
 	// metricsCh is used to stop the metrics streaming
 	metricsCh chan struct{}
@@ -682,6 +694,16 @@ type CoreConfig struct {
 	// seal in migration scenarios.
 	UnwrapSeal Seal
 
+	// ExternalEntropy, when non-nil, is a reader that blends HSM-derived
+	// bytes with the OS PRNG. It is handed out to mounts that opt in via
+	// `external_entropy_access = true`. See helper/pkcs11util and vault.
+	// BuildEntropyAugmenter for the construction path.
+	ExternalEntropy io.Reader
+
+	// ExternalEntropyClient owns the PKCS#11 session backing ExternalEntropy.
+	// Core calls Close on it during shutdown.
+	ExternalEntropyClient io.Closer
+
 	LogLevel string
 
 	Logger log.Logger
@@ -898,6 +920,9 @@ func CreateCore(conf *CoreConfig) (*Core, error) {
 		storageType:         conf.StorageType,
 		redirectAddr:        conf.RedirectAddr,
 		seal:                conf.Seal,
+
+		externalEntropy:       conf.ExternalEntropy,
+		externalEntropyClient: conf.ExternalEntropyClient,
 		stateLock:           stateLock,
 		router:              routing.NewRouter(routerLogger),
 		baseLogger:          conf.Logger,
@@ -1017,6 +1042,19 @@ func CreateCore(conf *CoreConfig) (*Core, error) {
 
 func coreInit(c *Core, conf *CoreConfig) error {
 	phys := conf.Physical
+
+	// Seal wrap layer sits BELOW the LRU cache so cache hits skip the seal
+	// round-trip entirely. Only entries flagged SealWrap=true by the caller
+	// get wrapped; all other traffic passes through unchanged. We also skip
+	// wiring this layer if DisableSealWrap is set (the operator explicitly
+	// turned it off) or if no auto-seal is configured (shamir-only deploys
+	// have no external wrapper to call into for extra encryption).
+	if !conf.DisableSealWrap && c.seal != nil && c.seal.GetAccess() != nil && c.seal.BarrierType() != vaultseal.WrapperTypeShamir {
+		sealWrapLogger := c.baseLogger.Named("storage.seal-wrap")
+		c.allLoggers = append(c.allLoggers, sealWrapLogger)
+		phys = NewSealWrappingBackend(phys, c.seal.GetAccess(), sealWrapLogger)
+	}
+
 	// Wrap the physical backend in a cache layer if enabled
 	cacheLogger := c.baseLogger.Named("storage.cache")
 	c.allLoggers = append(c.allLoggers, cacheLogger)
@@ -1340,6 +1378,15 @@ func (c *Core) Shutdown() error {
 
 	c.stateLock.Lock()
 	defer c.stateLock.Unlock()
+
+	// Release any HSM session owned by the entropy augmenter. This is
+	// idempotent and safe to call whether or not entropy was configured.
+	if c.externalEntropyClient != nil {
+		if cerr := c.externalEntropyClient.Close(); cerr != nil {
+			c.logger.Warn("error closing entropy augmenter", "error", cerr)
+		}
+		c.externalEntropyClient = nil
+	}
 
 	doneCh := c.shutdownDoneCh.Load().(chan struct{})
 	if doneCh != nil {
@@ -2322,6 +2369,9 @@ func (readonlyUnsealStrategy) unsealShared(ctx context.Context, c *Core, standby
 	if err := c.setupNamespaceStore(ctx); err != nil {
 		return err
 	}
+	if err := c.setupExternalKeys(); err != nil {
+		return err
+	}
 	if err := c.loadMounts(ctx, standby); err != nil {
 		return err
 	}
@@ -2542,6 +2592,9 @@ func (c *Core) preSeal() error {
 	}
 	if err := c.teardownLoginMFA(); err != nil {
 		result = multierror.Append(result, fmt.Errorf("error tearing down login MFA: %w", err))
+	}
+	if err := c.teardownExternalKeys(); err != nil {
+		result = multierror.Append(result, fmt.Errorf("error tearing down external keys registry: %w", err))
 	}
 	if err := c.teardownNamespaceStore(); err != nil {
 		result = multierror.Append(result, fmt.Errorf("error tearing down namespace store: %w", err))
@@ -3613,6 +3666,15 @@ func (c *Core) ReloadIntrospectionEndpointEnabled() {
 	c.introspectionEnabledLock.Lock()
 	defer c.introspectionEnabledLock.Unlock()
 	c.introspectionEnabled = conf.EnableIntrospectionEndpoint
+}
+
+func (c *Core) ReloadExternalKeys() {
+	conf := c.rawConfig.Load()
+	if conf == nil {
+		return
+	}
+	// TODO(satoqz): Reload all affected external key configs.
+	// externalKeyStanzas := conf.(*server.Config).ExternalKeys
 }
 
 type PeerNode struct {
