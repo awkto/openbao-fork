@@ -204,7 +204,11 @@ func (r *Router) Mount(backend logical.Backend, prefix string, mountEntry *Mount
 		Backend:       backend,
 		MountEntry:    mountEntry,
 		StoragePrefix: storageView.Prefix(),
-		StorageView:   storageView,
+		// Wrap the view so paths declared SealWrapStorage by the backend
+		// get SealWrap=true propagated on Put when the mount opted in. This
+		// is the glue that turns MountEntry.SealWrap from a plumbed-but-
+		// unused bool into real seal-wrapping at the storage layer.
+		StorageView: newSealWrapStorageAdapter(storageView, mountEntry.SealWrap, paths.SealWrapStorage),
 	}
 	re.rootPaths.Store(PathsToRadix(paths.Root))
 	loginPathsEntry, err := ParseUnauthenticatedPaths(paths.Unauthenticated)
